@@ -1,8 +1,49 @@
-import test from 'node:test'; import assert from 'node:assert/strict'; import { containerPlan, dashboard, gateConflicts, prioritizeTasks } from './domain.js';
+import test from 'node:test'; import assert from 'node:assert/strict'; import { blockDetail, blocks, containerPlan, dashboard, gateConflicts, prioritizeTasks } from './domain.js';
 test('dashboard aggregates berth, yard, gate and exception signals', () => { const data = dashboard(); assert.equal(data.activeVoyages, 2); assert.ok(data.yardUtilization > 0.7); assert.ok(data.blockedTasks >= 1); });
 test('gate conflict engine detects same truck overlap', () => { const conflicts = gateConflicts(); assert.ok(conflicts.some(item => item.appointmentId === 'APT-9001' || item.appointmentId === 'APT-9004')); });
 test('yard planner respects reefer and hazmat constraints', () => { const plan = containerPlan('TGHU-9831204'); assert.equal(plan?.recommendedBlock?.hazmatAllowed, true); assert.ok(plan?.reasons.some(reason => reason.includes('危险品'))); });
 test('priority queue promotes customs inspection work', () => { const tasks = prioritizeTasks(); assert.equal(tasks[0].containerId, 'TGHU-9831204'); });
+
+test('block detail aggregates containers, open tasks and accessible equipment', () => {
+  const detail = blockDetail('B07');
+  assert.ok(detail);
+  assert.equal(detail!.block.id, 'B07');
+  assert.ok(detail!.containers.some(c => c.id === 'EISU-1288420'));
+  assert.ok(detail!.reefer.reeferContainers.some(c => c.id === 'EISU-1288420'));
+  assert.equal(detail!.reefer.plugsFree, detail!.reefer.plugsTotal - detail!.reefer.plugsUsed);
+  assert.ok(detail!.openTasks.some(t => t.id === 'TASK-102'));
+  assert.ok(!detail!.openTasks.some(t => t.status === 'done'));
+  assert.ok(detail!.equipment.some(e => e.id === 'YC-12'));
+  assert.ok(detail!.availableCount >= 0);
+});
+
+test('inspection zone surfaces inspection-specific advisory', () => {
+  const detail = blockDetail('D05');
+  assert.ok(detail);
+  assert.equal(detail!.advisory.tone, 'inspection');
+  assert.match(detail!.advisory.title, /查验/);
+  assert.ok(detail!.hazmat.hazmatContainers.some(c => c.id === 'TGHU-9831204'));
+  assert.ok(detail!.hazmat.heldCount >= 1);
+  assert.ok(detail!.advisory.reasons.some(reason => reason.includes('正面吊')));
+});
+
+test('missing block returns undefined so the API can return an explicit empty state', () => {
+  assert.equal(blockDetail('Z99'), undefined);
+});
+
+test('full block triggers the stop-intake advisory and points to an alternative', () => {
+  const target = blocks.find(b => b.id === 'A01')!;
+  const originalOccupied = target.occupied;
+  target.occupied = target.capacity;
+  try {
+    const detail = blockDetail('A01');
+    assert.equal(detail!.advisory.tone, 'full');
+    assert.ok(detail!.advisory.reasons.some(reason => reason.includes('满载')));
+    assert.ok(detail!.advisory.reasons.some(reason => reason.includes('C03')));
+  } finally {
+    target.occupied = originalOccupied;
+  }
+});
 
 test('container create, update and delete form a complete audited CRUD cycle', async () => {
   const { createContainer, updateContainer, deleteContainer, containers } = await import('./domain.js');

@@ -69,6 +69,84 @@ export function gateConflicts() {
   return result;
 }
 export function yardHeatmap() { return blocks.map(block => ({ ...block, utilization: block.occupied / block.capacity, freeSlots: block.capacity - block.occupied, pressure: block.heat > 85 ? 'critical' : block.heat > 65 ? 'warning' : 'normal' })); }
+export interface BlockAdvisory { tone: 'inspection' | 'full' | 'critical' | 'normal'; title: string; reasons: string[]; }
+export interface BlockDetail {
+  block: ReturnType<typeof yardHeatmap>[number];
+  containers: Container[];
+  reefer: { plugsTotal: number; plugsUsed: number; plugsFree: number; reeferContainers: Container[]; alerts: string[] };
+  hazmat: { hazmatAllowed: boolean; hazmatContainers: Container[]; heldCount: number };
+  openTasks: ReturnType<typeof prioritizeTasks>;
+  equipment: Equipment[];
+  availableCount: number;
+  advisory: BlockAdvisory;
+}
+export function blockDetail(id: string): BlockDetail | undefined {
+  const block = blocks.find(item => item.id === id);
+  if (!block) return undefined;
+  const summary = yardHeatmap().find(item => item.id === id)!;
+  const containersInBlock = containers.filter(container => parseSlot(container.yardSlot) === id);
+  const reeferContainers = containersInBlock.filter(container => container.reefer);
+  const hazmatContainers = containersInBlock.filter(container => container.hazmatClass);
+  const heldCount = containersInBlock.filter(container => container.customs !== 'released').length;
+  const openTasks = prioritizeTasks().filter(task => task.status !== 'done' && (parseSlot(task.from) === id || parseSlot(task.to) === id));
+  const accessible = equipment.filter(machine => block.equipment.includes(machine.kind));
+  const plugsFree = block.reeferPlugs - block.usedPlugs;
+  const alerts: string[] = [];
+  for (const container of reeferContainers) {
+    if (container.customs !== 'released') alerts.push(`${container.id} 冷藏查验箱（${container.temperature ?? 4}°C），插座需保留至海关放行`);
+    else if ((container.temperature ?? 0) > 5) alerts.push(`${container.id} 回传温度 ${container.temperature}°C，高于冷藏安全阈值`);
+  }
+  if (reeferContainers.length && plugsFree <= 1) alerts.push(`冷藏插座余量仅 ${plugsFree} 个，新到冷藏箱可能无法接电`);
+  const advisory = buildBlockAdvisory(block, { openTasks, heldCount, plugsFree, accessible });
+  return {
+    block: summary,
+    containers: containersInBlock,
+    reefer: { plugsTotal: block.reeferPlugs, plugsUsed: block.usedPlugs, plugsFree, reeferContainers, alerts },
+    hazmat: { hazmatAllowed: block.hazmatAllowed, hazmatContainers, heldCount },
+    openTasks,
+    equipment: accessible,
+    availableCount: accessible.filter(machine => machine.status === 'available').length,
+    advisory
+  };
+}
+function buildBlockAdvisory(block: YardBlock, context: { openTasks: YardTask[]; heldCount: number; plugsFree: number; accessible: Equipment[] }): BlockAdvisory {
+  const reasons: string[] = [];
+  const utilizationPct = Math.round((block.occupied / block.capacity) * 100);
+  const blockedCount = context.openTasks.filter(task => task.status === 'blocked').length;
+  const plugLine = context.plugsFree === 0
+    ? '冷藏插座已全部占用，冷藏箱暂停入场'
+    : context.plugsFree <= 2 ? `冷藏插座仅剩 ${context.plugsFree} 个，接电箱到场前先预留电源位` : undefined;
+  if (/inspection|hold|查验/i.test(block.zone)) {
+    reasons.push(context.heldCount > 0
+      ? `区内 ${context.heldCount} 箱处于查验/扣留状态，海关放行前不得提箱出场`
+      : '本区为海关监管查验区，任何箱位移动都须保持监管链完整');
+    if (blockedCount > 0) reasons.push(`${blockedCount} 个关联任务处于阻塞，需等待查验窗口或调度可用正面吊`);
+    if (plugLine) reasons.push(plugLine);
+    if (!context.accessible.some(machine => machine.kind === 'reach-stacker' && machine.status === 'available')) reasons.push('正面吊当前不可用（维护/离线），查验掏箱需先协调替代设备');
+    reasons.push('查验箱移位须双人确认并写入审计，避免监管链断裂');
+    return { tone: 'inspection', title: '查验 / 监管区处置提示', reasons };
+  }
+  if (block.occupied >= block.capacity) {
+    reasons.push(`区块容量已满载（${block.occupied}/${block.capacity}，占用率 ${utilizationPct}%），自动堆位推荐已跳过本区块`);
+    const alternative = blocks.filter(item => item.id !== block.id && item.capacity > item.occupied).sort((a, b) => a.heat - b.heat)[0];
+    reasons.push(alternative
+      ? `新到箱请引导至 ${alternative.id} · ${alternative.zone}（空位 ${alternative.capacity - alternative.occupied}，热度 ${alternative.heat}）`
+      : '全场暂无可用替代区块，请立即联系中控扩容或安排外转');
+    if (context.openTasks.length) reasons.push(`优先推进 ${context.openTasks.length} 个出场/翻箱任务以释放堆位`);
+    if (plugLine) reasons.push(plugLine);
+    return { tone: 'full', title: '满载处置提示 · 暂停入场', reasons };
+  }
+  if (block.heat > 85) {
+    reasons.push(`热度指数 ${block.heat}、占用率 ${utilizationPct}%，本区块属高压热区`);
+    reasons.push('暂停追加低优先级中转箱，出场/装船任务优先于进场收箱');
+    if (context.openTasks.length) reasons.push(`${context.openTasks.length} 个未完成任务关联本区块，避免翻箱叠加进一步抬升热度`);
+    if (plugLine) reasons.push(plugLine);
+    return { tone: 'critical', title: '高压热区 · 控制入场节奏', reasons };
+  }
+  reasons.push(`区块压力正常（热度 ${block.heat}，空位 ${block.capacity - block.occupied}），可按常规计划收发箱`);
+  if (plugLine) reasons.push(plugLine);
+  return { tone: 'normal', title: '区块运行平稳', reasons };
+}
 export function containerPlan(containerId: string) {
   const container = containers.find(c => c.id === containerId); if (!container) return undefined;
   const reasons: string[] = []; const candidates = blocks.filter(block => block.capacity > block.occupied && (!container.hazmatClass || block.hazmatAllowed) && (!container.reefer || block.reeferPlugs > block.usedPlugs));
