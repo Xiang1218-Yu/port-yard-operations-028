@@ -1,5 +1,5 @@
 import express from 'express';
-import { appointments, assignTask, blocks, containerDetail, containers, createContainer, createGateAppointment, createYardTask, dashboard, deleteContainer, deleteGateAppointment, deleteYardTask, editGateAppointment, equipment, gateConflicts, prioritizeTasks, tasks, updateContainer, updateYardTask, voyages, yardHeatmap } from './domain.js';
+import { appointments, assignTask, blockDetail, blocks, containerDetail, containers, createContainer, createGateAppointment, createYardTask, dashboard, deleteContainer, deleteGateAppointment, deleteYardTask, editGateAppointment, equipment, gateConflicts, prioritizeTasks, tasks, updateContainer, updateYardTask, voyages, yardHeatmap } from './domain.js';
 const app = express(); app.use(express.json());
 app.get('/api/dashboard', (_req, res) => res.json(dashboard()));
 app.get('/api/voyages', (_req, res) => res.json(voyages));
@@ -10,6 +10,7 @@ app.delete('/api/containers/:id', (req, res) => { const result = deleteContainer
 app.get('/api/containers/:id', (req, res) => { const result = containerDetail(req.params.id); if (!result) return res.status(404).json({ message: '箱号不存在' }); res.json(result); });
 app.get('/api/yard/heatmap', (_req, res) => res.json(yardHeatmap()));
 app.get('/api/yard/blocks', (_req, res) => res.json(blocks));
+app.get('/api/yard/blocks/:id/detail', (req, res) => { const result = blockDetail(req.params.id); if (!result) return res.status(404).json({ message: '区块不存在或已下线' }); res.json(result); });
 app.get('/api/gate/appointments', (_req, res) => res.json(appointments));
 app.get('/api/gate/conflicts', (_req, res) => res.json(gateConflicts()));
 app.post('/api/gate/appointments', (req, res) => { try { res.status(201).json(createGateAppointment(req.body)); } catch (error) { res.status(409).json({ message: error instanceof Error ? error.message : '预约失败' }); } });

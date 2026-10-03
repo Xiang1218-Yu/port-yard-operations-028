@@ -69,6 +69,27 @@ export function gateConflicts() {
   return result;
 }
 export function yardHeatmap() { return blocks.map(block => ({ ...block, utilization: block.occupied / block.capacity, freeSlots: block.capacity - block.occupied, pressure: block.heat > 85 ? 'critical' : block.heat > 65 ? 'warning' : 'normal' })); }
+export function blockDetail(blockId: string) {
+  const block = blocks.find(item => item.id === blockId);
+  if (!block) return undefined;
+  const summary = yardHeatmap().find(item => item.id === blockId)!;
+  const containersInBlock = containers.filter(item => parseSlot(item.yardSlot) === blockId);
+  const containerIds = new Set(containersInBlock.map(item => item.id));
+  const pendingTasks = prioritizeTasks().filter(task => task.status !== 'done' && (containerIds.has(task.containerId) || parseSlot(task.from) === blockId || parseSlot(task.to) === blockId));
+  const statusRank: Record<Equipment['status'], number> = { available: 0, working: 1, maintenance: 2, offline: 3 };
+  const availableEquipment = equipment.filter(item => block.equipment.includes(item.kind) && (item.location.startsWith(blockId) || item.status === 'available')).sort((a, b) => statusRank[a.status] - statusRank[b.status]);
+  const stats = { containerCount: containersInBlock.length, reeferCount: containersInBlock.filter(item => item.reefer).length, hazmatCount: containersInBlock.filter(item => item.hazmatClass).length, customsHeld: containersInBlock.filter(item => item.customs !== 'released').length, plugFree: block.reeferPlugs - block.usedPlugs };
+  const advice: { tone: 'critical' | 'warning' | 'info'; text: string }[] = [];
+  const freeSlots = block.capacity - block.occupied;
+  if (/inspection|查验/i.test(block.zone)) advice.push({ tone: 'warning', text: '查验监管区：海关查验任务优先，未放行箱不得移出本区，移箱前先核对海关状态。' });
+  if (freeSlots <= 0) advice.push({ tone: 'critical', text: '区块已满载：暂停新的进场与落箱任务，优先执行出场和翻箱任务释放堆位。' });
+  else if (freeSlots * 10 <= block.capacity) advice.push({ tone: 'warning', text: `接近满载：仅剩 ${freeSlots} 个堆位，新到箱建议导流至低热度区块。` });
+  if (block.heat > 85) advice.push({ tone: 'critical', text: `堆存热度 ${block.heat} 已越临界，优先安排翻箱与出场作业为区块降温。` });
+  if (block.reeferPlugs > 0 && stats.plugFree <= 1) advice.push({ tone: 'warning', text: `冷藏插座仅剩 ${stats.plugFree} 个，新冷藏箱进场前必须确认电源余量。` });
+  if (stats.hazmatCount > 0) advice.push({ tone: 'info', text: `区内有 ${stats.hazmatCount} 个危险品箱，保持隔离并优先安排查验或出场。` });
+  if (!advice.length) advice.push({ tone: 'info', text: '区块运行正常，可按堆位推荐继续组织进场作业。' });
+  return { block: summary, containers: containersInBlock, stats, pendingTasks, equipment: availableEquipment, advice };
+}
 export function containerPlan(containerId: string) {
   const container = containers.find(c => c.id === containerId); if (!container) return undefined;
   const reasons: string[] = []; const candidates = blocks.filter(block => block.capacity > block.occupied && (!container.hazmatClass || block.hazmatAllowed) && (!container.reefer || block.reeferPlugs > block.usedPlugs));

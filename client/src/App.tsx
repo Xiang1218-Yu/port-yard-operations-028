@@ -1,4 +1,4 @@
-import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 type Dashboard = { activeVoyages: number; berthMoves: number; yardUtilization: number; gateQueue: number; pendingTasks: number; blockedTasks: number; reeferAlerts: number; hazmatHolds: number; lateVessels: number };
 type Voyage = { id: string; vessel: string; service: string; eta: string; etd: string; status: string; berth: string; movesPlanned: number; movesDone: number; lateRisk: string };
@@ -10,6 +10,12 @@ type Task = { id: string; kind: string; containerId: string; from: string; to: s
 type Equipment = { id: string; name: string; kind: string; status: string; location: string; battery: number; queue: number; movesPerHour: number };
 type Section = 'control'|'containers'|'gate'|'yard'|'tasks';
 type Editor = { entity: 'container'|'appointment'|'task'; mode: 'create'|'edit'; id?: string; values: Record<string, string|boolean> };
+type BlockAdvice = { tone: 'critical'|'warning'|'info'; text: string };
+type BlockDetail = { block: Block; containers: Container[]; stats: { containerCount: number; reeferCount: number; hazmatCount: number; customsHeld: number; plugFree: number }; pendingTasks: Task[]; equipment: Equipment[]; advice: BlockAdvice[] };
+type BlockDetailView = { status: 'idle'|'loading'|'ready'|'missing'; detail?: BlockDetail; refreshing?: boolean };
+type BlockRef = { id: string; zone: string };
+type ContainerDetail = { container: Container; voyage?: Voyage; appointment?: Appointment; plan?: { recommendedBlock?: BlockRef; alternatives: BlockRef[]; reasons: string[] }; tasks: Task[] };
+type ContainerModal = { id: string; detail?: ContainerDetail; error?: string };
 
 const api = '/api';
 const pct = (value: number) => `${Math.round(value * 100)}%`;
@@ -31,6 +37,8 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return body as T;
 }
 
+const taskRow = (task: Task, showScore = true) => <div className="detail-task" key={task.id}><span className={`pill ${task.status}`}>{task.status}</span><span className="dt-main"><b>{task.id} · {task.kind}</b><small>{task.containerId} · {task.from} → {task.to}</small>{task.blockingReasons.length>0 && <small className="blocked-text">{task.blockingReasons[0]}</small>}</span><span className="dt-meta">{showScore && <b>{task.score}</b>}<small>{task.equipmentId ?? '未指派'} · {task.estimatedMinutes}min</small></span></div>;
+
 export default function App() {
   const [dashboard, setDashboard] = useState<Dashboard>();
   const [voyages, setVoyages] = useState<Voyage[]>([]);
@@ -42,6 +50,10 @@ export default function App() {
   const [equipment, setEquipment] = useState<Equipment[]>([]);
   const [tab, setTab] = useState<Section>('control');
   const [selectedVoyage, setSelectedVoyage] = useState('VOY-AX7');
+  const [selectedBlockId, setSelectedBlockId] = useState<string>();
+  const [blockDetail, setBlockDetail] = useState<BlockDetailView>({ status: 'idle' });
+  const [containerModal, setContainerModal] = useState<ContainerModal>();
+  const blockRequestRef = useRef(0);
   const [editor, setEditor] = useState<Editor>();
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
@@ -56,6 +68,29 @@ export default function App() {
     setDashboard(d); setVoyages(v); setContainers(ctn); setBlocks(b); setConflicts(cf); setAppointments(a); setTasks(t); setEquipment(e);
   }, []);
   useEffect(() => { void load().catch(reason => setError(reason instanceof Error ? reason.message : '无法连接服务端')); }, [load]);
+
+  // 区块详情随全局刷新同步：区块在刷新后消失时立即切换为明确空态，不沿用上一次内容
+  useEffect(() => {
+    if (!selectedBlockId) { setBlockDetail({ status: 'idle' }); return; }
+    if (!blocks.some(block => block.id === selectedBlockId)) {
+      blockRequestRef.current += 1;
+      setBlockDetail({ status: 'missing' });
+      return;
+    }
+    const ticket = ++blockRequestRef.current;
+    setBlockDetail(current => current.status === 'ready' ? { ...current, refreshing: true } : { status: 'loading' });
+    request<BlockDetail>(`/yard/blocks/${encodeURIComponent(selectedBlockId)}/detail`)
+      .then(detail => { if (ticket === blockRequestRef.current) setBlockDetail({ status: 'ready', detail }); })
+      .catch(() => { if (ticket === blockRequestRef.current) setBlockDetail({ status: 'missing' }); });
+  }, [blocks, selectedBlockId]);
+
+  const toggleBlock = (blockId: string) => setSelectedBlockId(current => current === blockId ? undefined : blockId);
+  const openContainerDetail = (containerId: string) => {
+    setContainerModal({ id: containerId });
+    request<ContainerDetail>(`/containers/${encodeURIComponent(containerId)}`)
+      .then(detail => setContainerModal(current => current?.id === containerId ? { id: containerId, detail } : current))
+      .catch(reason => setContainerModal(current => current?.id === containerId ? { id: containerId, error: reason instanceof Error ? reason.message : '箱务详情加载失败' } : current));
+  };
 
   const mutate = async (path: string, method: string, body?: unknown) => {
     setBusy(true); setError('');
@@ -96,6 +131,8 @@ export default function App() {
   const selected = voyages.find(voyage => voyage.id === selectedVoyage);
   const remaining = selected ? selected.movesPlanned - selected.movesDone : 0;
   const maxHeat = useMemo(() => Math.max(...blocks.map(block => block.heat), 1), [blocks]);
+  const readyBlockDetail = blockDetail.status === 'ready' ? blockDetail.detail : undefined;
+  const activeContainerDetail = containerModal?.detail;
 
   if (!dashboard && error) return <main className="connection-error"><div className="eyebrow">API CONNECTION ERROR</div><h1>无法连接港口作业服务</h1><p>{error}</p><p>请从项目根目录运行 <code>npm run dev</code>，确认前端 5178 和 API 4107 均已启动。</p><button onClick={() => { setError(''); void load().catch(reason => setError(reason instanceof Error ? reason.message : '无法连接服务端')); }}>重新连接</button></main>;
   if (!dashboard) return <div className="loading">正在连接码头实时作业中台…</div>;
@@ -108,7 +145,22 @@ export default function App() {
     {tab === 'control' && <div className="layout"><section className="panel vessel-panel"><div className="panel-head"><div><div className="eyebrow">VESSEL WINDOW / 船期窗口</div><h2>泊位作业进度</h2></div><span className="muted">剩余作业动态计算</span></div>{voyages.map(voyage => <button key={voyage.id} className={`vessel ${selectedVoyage===voyage.id?'selected':''}`} onClick={() => setSelectedVoyage(voyage.id)}><span className={`vessel-dot ${voyage.status}`}/><span className="vessel-main"><b>{voyage.vessel}</b><small>{voyage.id} · {voyage.service} · {voyage.berth}</small><i><em style={{ width: `${Math.min(100, voyage.movesDone / voyage.movesPlanned * 100)}%` }}/></i></span><span className="vessel-move"><b>{voyage.movesDone.toLocaleString()}</b><small>/ {voyage.movesPlanned.toLocaleString()} moves</small></span><strong className={voyage.lateRisk}>{voyage.lateRisk==='high'?'HIGH':voyage.lateRisk==='medium'?'WATCH':'ON TIME'}</strong></button>)}</section><section className="panel focus-panel"><div className="panel-head"><div><div className="eyebrow">SELECTED VOYAGE / {selected?.id}</div><h2>{selected?.vessel}</h2></div><span className={`badge ${selected?.lateRisk}`}>{selected?.status}</span></div><div className="voyage-stats"><div><small>ETA</small><b>{selected&&time(selected.eta)}</b><span>预计靠泊</span></div><div><small>ETD</small><b>{selected&&time(selected.etd)}</b><span>计划离港</span></div><div><small>REMAINING</small><b>{remaining}</b><span>剩余翻箱</span></div></div><div className="berth-map"><div className="water"><span>岸线 / BERTH</span><i className="ship" style={{ left: `${selected?.berth==='B07'?50:24}%` }}>{selected?.vessel}</i><b>B01</b><b>B04</b><b>B07</b><b>B10</b></div></div><div className="callout"><strong>调度策略</strong><span>已把 {dashboard.blockedTasks} 个阻塞任务、{dashboard.gateQueue} 车闸口压力纳入当前窗口；优先保护冷藏与危险品安全约束。</span></div></section><section className="panel wide"><div className="panel-head"><h3>异常与联动信号</h3><span>{conflicts.length} gate conflicts detected</span></div><div className="signal-grid"><div><strong className="critical">{dashboard.blockedTasks}</strong><span>设备/约束阻塞</span><small>最高优先级：海关查验任务</small></div><div><strong className="warning">{conflicts.length}</strong><span>闸口预约冲突</span><small>同车重叠窗口需人工重排</small></div><div><strong className="warning">{dashboard.reeferAlerts}</strong><span>冷藏与温控风险</span><small>查验区电源余量接近阈值</small></div><div><strong className="ok">{equipment.filter(item => item.status==='available').length}</strong><span>可调度设备</span><small>场桥 / 正面吊 / 集卡</small></div></div></section></div>}
     {tab === 'containers' && <section className="panel wide"><div className="panel-head"><div><div className="eyebrow">CONTAINER REGISTER / CRUD</div><h2>箱务台账</h2><span className="muted">新增、查询、编辑、删除；危险品与冷藏箱受堆场约束校验</span></div><button className="primary-action" onClick={() => openCreate('container')}>＋ 新增箱务</button></div><div className="table container-table"><div className="tr th"><span>箱号 / 航次</span><span>尺寸 / 流向</span><span>箱况 / 海关</span><span>堆位</span><span>重量 / 属性</span><span>操作</span></div>{containers.map(container => <div className="tr" key={container.id}><span><b>{container.id}</b><small>{container.voyageId} · {container.lastEvent}</small></span><span>{container.size}ft · {container.direction}<small>{container.isoType}</small></span><span><b>{container.status}</b><small>海关：{container.customs}</small></span><span>{container.yardSlot}</span><span>{container.weightT}t<small>{container.reefer?`冷藏 ${container.temperature}°C`:container.hazmatClass?`危险品 ${container.hazmatClass} 类`:'普通箱'}</small></span><span className="row-actions"><button onClick={() => openEdit('container', container.id, { ...container, weightT: String(container.weightT), temperature: String(container.temperature ?? 4), hazmatClass: container.hazmatClass ?? '' })}>编辑</button><button className="danger-action" onClick={() => void remove('container', container.id)}>删除</button></span></div>)}</div></section>}
     {tab === 'gate' && <section className="panel wide"><div className="panel-head"><div><div className="eyebrow">GATE APPOINTMENT / SLOT CONTROL</div><h2>闸口预约与车道状态</h2><span className="muted">支持新增预约、编辑时隙、签到/完成和删除</span></div><button className="primary-action" onClick={() => openCreate('appointment')}>＋ 新增预约</button></div>{conflicts.map(conflict => <div className="conflict" key={`${conflict.appointmentId}-${conflict.reason}`}><strong>{conflict.severity}</strong><b>{conflict.appointmentId}</b><span>{conflict.reason}</span></div>)}<div className="table"><div className="tr th"><span>预约</span><span>箱号 / 车辆</span><span>窗口</span><span>车道</span><span>状态</span><span>操作</span></div>{appointments.map(appointment => <div className="tr" key={appointment.id}><span><b>{appointment.id}</b><small>{appointment.type}</small></span><span><b>{appointment.containerId}</b><small>{appointment.truckNo} · {appointment.driver}</small></span><span>{time(appointment.windowStart)}—{time(appointment.windowEnd)}</span><span>{appointment.lane}</span><span className={`pill ${appointment.status}`}>{appointment.status}</span><span className="row-actions">{appointment.status==='booked'?<button onClick={() => void updateAppointmentStatus(appointment.id, 'checked-in')}>签到</button>:appointment.status==='checked-in'?<button onClick={() => void updateAppointmentStatus(appointment.id, 'completed')}>完成</button>:null}<button onClick={() => openEdit('appointment', appointment.id, { ...appointment, windowStart: toLocalInput(appointment.windowStart), windowEnd: toLocalInput(appointment.windowEnd) })}>编辑</button><button className="danger-action" onClick={() => void remove('appointment', appointment.id)}>删除</button></span></div>)}</div></section>}
-    {tab === 'yard' && <section className="panel wide"><div className="panel-head"><div><div className="eyebrow">YARD HEATMAP / STACK DENSITY</div><h2>堆场容量与安全约束</h2></div><span className="muted">实时区块压力</span></div><div className="yard-grid">{blocks.map(block => <div className={`block ${block.pressure}`} key={block.id}><div className="block-top"><b>{block.id}</b><strong>{pct(block.utilization)}</strong></div><span>{block.zone}</span><div className="heat"><i style={{ width: `${block.heat / maxHeat * 100}%` }}/></div><div className="block-stats"><span>空位 {block.freeSlots}</span><span>冷插 {block.usedPlugs}/{block.reeferPlugs}</span><span>{block.hazmatAllowed?'危险品可入':'普通区'}</span></div></div>)}</div><div className="yard-note"><span>堆位推荐会同时考虑容量、热区、危险品隔离、冷藏插座和设备可达性。</span><b>A01 → C03 重排建议可释放 21 个低热度堆位</b></div></section>}
+    {tab === 'yard' && <div className="layout"><section className="panel"><div className="panel-head"><div><div className="eyebrow">YARD HEATMAP / STACK DENSITY</div><h2>堆场容量与安全约束</h2></div><span className="muted">点击区块查看压力来源</span></div><div className="yard-grid">{blocks.map(block => <button type="button" className={`block ${block.pressure} ${selectedBlockId===block.id?'selected':''}`} key={block.id} onClick={() => toggleBlock(block.id)}><div className="block-top"><b>{block.id}</b><strong>{pct(block.utilization)}</strong></div><span>{block.zone}</span><div className="heat"><i style={{ width: `${block.heat / maxHeat * 100}%` }}/></div><div className="block-stats"><span>空位 {block.freeSlots}</span><span>冷插 {block.usedPlugs}/{block.reeferPlugs}</span><span>{block.hazmatAllowed?'危险品可入':'普通区'}</span></div></button>)}</div><div className="yard-note"><span>堆位推荐会同时考虑容量、热区、危险品隔离、冷藏插座和设备可达性。</span><b>A01 → C03 重排建议可释放 21 个低热度堆位</b></div></section><section className="panel block-detail-panel"><div className="panel-head"><div><div className="eyebrow">BLOCK DETAIL / 区块详情</div><h2>{readyBlockDetail ? `${readyBlockDetail.block.id} · ${readyBlockDetail.block.zone}` : selectedBlockId ? `${selectedBlockId} 区块` : '未选择区块'}</h2></div>{selectedBlockId && <button type="button" className="icon-button" onClick={() => setSelectedBlockId(undefined)}>×</button>}</div>
+      {blockDetail.status==='idle' && <div className="empty-state"><b>尚未选择区块</b><span>点击左侧区块卡片，查看区内箱子、冷藏/危险品占用、关联未完成任务与可用设备。</span></div>}
+      {blockDetail.status==='loading' && <div className="empty-state"><b>正在载入</b><span>正在获取 {selectedBlockId} 区块的最新详情…</span></div>}
+      {blockDetail.status==='missing' && <div className="empty-state missing"><b>未找到 {selectedBlockId} 的最新数据</b><span>区块可能已在最近一次刷新中下线，或接口暂不可用。详情已清空，请重新选择区块或稍后重试。</span></div>}
+      {readyBlockDetail && <>
+        {blockDetail.refreshing && <div className="refreshing">正在同步最新区块数据…</div>}
+        <div className="advice-list">{readyBlockDetail.advice.map((item, index) => <div className={`advice ${item.tone}`} key={index}><strong>{item.tone==='critical'?'处置':item.tone==='warning'?'关注':'提示'}</strong><span>{item.text}</span></div>)}</div>
+        <div className="block-stats-grid"><div><small>堆位占用</small><b>{readyBlockDetail.block.occupied}/{readyBlockDetail.block.capacity}</b><span>{pct(readyBlockDetail.block.utilization)} · 空位 {readyBlockDetail.block.freeSlots}</span></div><div><small>冷藏插座</small><b>{readyBlockDetail.block.usedPlugs}/{readyBlockDetail.block.reeferPlugs}</b><span>剩余 {readyBlockDetail.stats.plugFree} 个</span></div><div><small>在区台账箱</small><b>{readyBlockDetail.stats.containerCount}</b><span>冷藏 {readyBlockDetail.stats.reeferCount} · 危险品 {readyBlockDetail.stats.hazmatCount}</span></div><div><small>海关未放行</small><b>{readyBlockDetail.stats.customsHeld}</b><span>{readyBlockDetail.block.hazmatAllowed?'危险品隔离资质':'普通区块'}</span></div></div>
+        <div className="detail-section"><div className="detail-section-head"><h3>区内箱子</h3><span>{readyBlockDetail.containers.length} 台在册</span></div>
+          {readyBlockDetail.containers.length===0 ? <div className="empty-state">该区块当前没有台账在册箱，占用可能来自未纳管堆存。</div> : readyBlockDetail.containers.map(container => <button type="button" className="block-container" key={container.id} onClick={() => openContainerDetail(container.id)}><span className="bc-main"><b>{container.id}</b><small>{container.yardSlot} · {container.lastEvent}</small></span><span className="bc-tags"><i>{container.size}ft · {container.direction}</i>{container.reefer && <i className="tag-reefer">冷藏 {container.temperature}°C</i>}{container.hazmatClass && <i className="tag-hazmat">危险品 {container.hazmatClass} 类</i>}{container.customs!=='released' && <i className="tag-customs">海关{container.customs==='inspection'?'查验中':'扣留'}</i>}</span><span className="bc-status"><b>{container.status}</b><small>{container.weightT}t</small></span></button>)}</div>
+        <div className="detail-section"><div className="detail-section-head"><h3>关联未完成任务</h3><span>{readyBlockDetail.pendingTasks.length} 项</span></div>
+          {readyBlockDetail.pendingTasks.length===0 ? <div className="empty-state">暂无涉及该区块的未完成任务。</div> : readyBlockDetail.pendingTasks.map(task => taskRow(task))}</div>
+        <div className="detail-section"><div className="detail-section-head"><h3>可用设备</h3><span>{readyBlockDetail.equipment.length} 台可调度</span></div>
+          {readyBlockDetail.equipment.length===0 ? <div className="empty-state">暂无定位在该区块或可调配的设备，请从设备池协调。</div> : readyBlockDetail.equipment.map(item => <div className="equipment" key={item.id}><i className={`equip-dot ${item.status}`}/><div><b>{item.name}</b><small>{item.location} · 队列 {item.queue} · {item.status}</small></div><strong>{item.battery}%</strong></div>)}</div>
+      </>}
+    </section></div>}
     {tab === 'tasks' && <div className="layout"><section className="panel wide"><div className="panel-head"><div><div className="eyebrow">TASK DISPATCH / EQUIPMENT POOL</div><h2>场内任务优先级与设备指派</h2><span className="muted">支持新增、编辑、删除和设备指派</span></div><button className="primary-action" onClick={() => openCreate('task')}>＋ 新建任务</button></div><div className="table task-table"><div className="tr th"><span>任务</span><span>箱号</span><span>路径</span><span>优先级</span><span>状态</span><span>设备 / 操作</span></div>{tasks.map(task => <div className="tr" key={task.id}><span><b>{task.id}</b><small>{task.kind} · {task.estimatedMinutes}min</small></span><span>{task.containerId}</span><span>{task.from} → {task.to}</span><span className={task.score>95?'critical':''}>{task.score}</span><span><span className={`pill ${task.status}`}>{task.status}</span>{task.blockingReasons.length>0&&<small className="blocked-text">{task.blockingReasons[0]}</small>}</span><span className="task-actions"><select value={task.equipmentId??''} onChange={event => void assign(task.id, event.target.value)}><option value="">未指派</option>{equipment.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}</select><button onClick={() => openEdit('task', task.id, { kind: task.kind, containerId: task.containerId, from: task.from, to: task.to, equipmentId: task.equipmentId ?? '', priority: String(task.priority), estimatedMinutes: String(task.estimatedMinutes), scheduledAt: toLocalInput(task.scheduledAt), status: task.status })}>编辑</button><button className="danger-action" onClick={() => void remove('task', task.id)}>删除</button></span></div>)}</div></section><section className="panel"><div className="panel-head"><h3>设备池</h3><span>{equipment.length} assets</span></div>{equipment.map(item => <div className="equipment" key={item.id}><i className={`equip-dot ${item.status}`}/><div><b>{item.name}</b><small>{item.location} · 队列 {item.queue}</small></div><strong>{item.battery}%</strong></div>)}</section></div>}
     <footer>HarborGrid · 内存种子数据 + REST API · 箱务台账、闸口预约、场内任务提供完整增删改查操作</footer>
     {editor && <div className="modal-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) setEditor(undefined); }}><form className="editor-modal" onSubmit={saveEditor}><div className="modal-head"><div><div className="eyebrow">{editor.mode.toUpperCase()} / {editor.entity.toUpperCase()}</div><h2>{editor.mode==='create'?'创建':'编辑'}{editor.entity==='container'?'箱务记录':editor.entity==='appointment'?'闸口预约':'作业任务'}</h2></div><button type="button" className="icon-button" onClick={() => setEditor(undefined)}>×</button></div>
@@ -144,5 +196,21 @@ export default function App() {
       </div>}
       {error && <div className="form-error">{error}</div>}<div className="modal-actions"><button type="button" onClick={() => setEditor(undefined)}>取消</button><button className="primary-action" disabled={busy}>{busy?'保存中…':'保存'}</button></div>
     </form></div>}
+    {containerModal && <div className="modal-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) setContainerModal(undefined); }}><div className="editor-modal container-modal"><div className="modal-head"><div><div className="eyebrow">CONTAINER DETAIL / 箱务详情</div><h2>{containerModal.id}</h2></div><button type="button" className="icon-button" onClick={() => setContainerModal(undefined)}>×</button></div>
+      {!activeContainerDetail && !containerModal.error && <div className="empty-state"><b>正在载入</b><span>正在获取 {containerModal.id} 的箱务详情…</span></div>}
+      {containerModal.error && <div className="empty-state missing"><b>无法载入箱务详情</b><span>{containerModal.error}——该箱可能刚被移出台账，请刷新后重试。</span></div>}
+      {activeContainerDetail && <>
+        <div className="detail-grid"><div><small>状态 / 优先级</small><b>{activeContainerDetail.container.status} · {activeContainerDetail.container.priority}</b></div><div><small>航次</small><b>{activeContainerDetail.voyage ? `${activeContainerDetail.voyage.id} · ${activeContainerDetail.voyage.vessel}` : activeContainerDetail.container.voyageId}</b></div><div><small>尺寸 / 箱型</small><b>{activeContainerDetail.container.size}ft · {activeContainerDetail.container.isoType}</b></div><div><small>流向 / 重量</small><b>{activeContainerDetail.container.direction} · {activeContainerDetail.container.weightT}t</b></div><div><small>海关状态</small><b>{activeContainerDetail.container.customs}</b></div><div><small>当前堆位</small><b>{activeContainerDetail.container.yardSlot}</b></div><div><small>冷藏</small><b>{activeContainerDetail.container.reefer ? `目标 ${activeContainerDetail.container.temperature}°C` : '非冷藏箱'}</b></div><div><small>危险品</small><b>{activeContainerDetail.container.hazmatClass ? `${activeContainerDetail.container.hazmatClass} 类` : '无'}</b></div><div><small>最近事件</small><b>{activeContainerDetail.container.lastEvent}</b></div></div>
+        <div className="detail-section"><div className="detail-section-head"><h3>闸口预约</h3><span>{activeContainerDetail.appointment?.id ?? '无预约'}</span></div>
+          {activeContainerDetail.appointment ? <div className="detail-task"><span className={`pill ${activeContainerDetail.appointment.status}`}>{activeContainerDetail.appointment.status}</span><span className="dt-main"><b>{activeContainerDetail.appointment.type==='pickup'?'提箱':'进场'} · {activeContainerDetail.appointment.truckNo} · {activeContainerDetail.appointment.driver}</b><small>{time(activeContainerDetail.appointment.windowStart)}—{time(activeContainerDetail.appointment.windowEnd)} · {activeContainerDetail.appointment.lane} 车道</small></span></div> : <div className="empty-state">暂无关联闸口预约。</div>}</div>
+        <div className="detail-section"><div className="detail-section-head"><h3>堆位推荐</h3><span>{activeContainerDetail.plan?.recommendedBlock ? `推荐 ${activeContainerDetail.plan.recommendedBlock.id}` : '暂无推荐'}</span></div>
+          {activeContainerDetail.plan ? <>
+            {(activeContainerDetail.plan.recommendedBlock || activeContainerDetail.plan.alternatives.length>0) ? <div className="plan-blocks">{activeContainerDetail.plan.recommendedBlock && <span className="plan-block recommended">{activeContainerDetail.plan.recommendedBlock.id} · {activeContainerDetail.plan.recommendedBlock.zone}</span>}{activeContainerDetail.plan.alternatives.map(block => <span className="plan-block" key={block.id}>{block.id} · {block.zone}</span>)}</div> : <div className="empty-state">当前没有满足冷藏/危险品/容量约束的堆位区块。</div>}
+            {activeContainerDetail.plan.reasons.length>0 && <ul className="plan-reasons">{activeContainerDetail.plan.reasons.map((reason, index) => <li key={index}>{reason}</li>)}</ul>}
+          </> : <div className="empty-state">堆位计划不可用。</div>}</div>
+        <div className="detail-section"><div className="detail-section-head"><h3>关联任务</h3><span>{activeContainerDetail.tasks.length} 项</span></div>
+          {activeContainerDetail.tasks.length===0 ? <div className="empty-state">暂无关联作业任务。</div> : activeContainerDetail.tasks.map(task => taskRow(task, false))}</div>
+      </>}
+    </div></div>}
   </main>;
 }
